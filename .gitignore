@@ -1,0 +1,145 @@
+####################################
+# OS / 기본 파일
+####################################
+.DS_Store
+Thumbs.db
+
+####################################
+# 환경 변수 / 보안
+####################################
+.env
+.env.*
+!.env.example
+*/keys/*
+
+####################################
+# IDE / Editor
+####################################
+.idea/
+.vscode/
+.spyderproject
+.spyproject
+.ropeproject
+
+####################################
+# Python 캐시 / 빌드 산출물
+####################################
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.Python
+
+####################################
+# 가상환경 (Poetry / venv)
+####################################
+.venv/
+.venv*/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+__pypackages__/
+poetry.toml
+.pdm.toml
+
+####################################
+# 테스트 / 분석 도구
+####################################
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+####################################
+# 로그
+####################################
+*.log
+logs/
+pip-log.txt
+pip-delete-this-directory.txt
+
+####################################
+# Jupyter / IPython
+####################################
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+profile_default/
+ipython_config.py
+*.ipynb
+
+####################################
+# 문서 / 바이너리 (RAG 특화)
+####################################
+*.pdf
+*.pkl
+*.gguf
+*.faiss
+*.index
+*.bin
+*.sqlite3
+*.wav
+
+####################################
+# RAG / Vector DB / 실험 산출물
+####################################
+.vectorstore/
+faiss_index/
+chroma/
+chromadb/
+db/
+data/
+storage/
+index/
+corpus/
+mlruns/
+cache/
+*/cache/*
+*/working/*
+working/
+*/convert/*
+*/convert2/*
+*/unuse/*
+
+####################################
+# Web / Framework
+####################################
+instance/
+.webassets-cache
+.scrapy
+docs/_build/
+site/
+
+####################################
+# Celery
+####################################
+celerybeat-schedule
+celerybeat.pid
+
+####################################
+# 기타
+####################################
+*.manifest
+*.spec
+*.sage.py
