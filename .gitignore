@@ -143,3 +143,6 @@ celerybeat.pid
 *.manifest
 *.spec
 *.sage.py
+*.cer
+*.pem
+*.pfx
