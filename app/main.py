@@ -1,57 +1,63 @@
 import os
-import sys
-import glob
-from typing import List, Annotated, TypedDict, Literal
-from contextlib import asynccontextmanager
 import re
+from typing import List, Annotated, TypedDict, Literal, Any, Dict
+from contextlib import asynccontextmanager
 
-# FastAPI
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 import uvicorn
 
-# LangChain & Models
 from langchain_ollama import ChatOllama
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
-from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import tool  # [NEW] Tool 데코레이터
+from langchain_core.tools import tool
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
 
-# LangGraph
 from langgraph.graph import END, StateGraph, START
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import ToolNode, tools_condition  # [NEW] 도구 노드
+from langgraph.prebuilt import ToolNode, tools_condition
 
-# 문서 처리 및 벡터 DB
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_community.utilities import SQLDatabase
 from dotenv import load_dotenv
-
-# [NEW] OPC 클라이언트 임포트
 from opc_client import IgnitionOpcClient
 
-# --- [0. 설정] ---
+# ----------------------------
+# [0] 설정 및 초기화
+# ----------------------------
 load_dotenv()
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-large"
 DB_PATH = "./faiss_index"
-LLM_MODEL_NAME = "qwen2.5:7b"
+LLM_MODEL_NAME = "llama3.1"
 
-# Ignition OPC UA 주소 (기본값)
 OPC_ENDPOINT = os.getenv("OPC_ENDPOINT", "opc.tcp://localhost:62541")
-OPC_USER = os.getenv("OPC_USER", "Admin")
-OPC_PASSWORD = os.getenv("OPC_PASSWORD", "P@ssw0rd")
-
 opc_client = IgnitionOpcClient(OPC_ENDPOINT)
 
-# --- [1. 도구(Tools) 정의] ---
+SQL_HOST = os.getenv("SQL_HOST", "127.0.0.1")
+SQL_PORT = int(os.getenv("SQL_PORT", "3306"))
+SQL_USER = os.getenv("SQL_USER", "ignition")
+SQL_PASSWORD = os.getenv("SQL_PASSWORD", "password")
+SQL_DB = os.getenv("SQL_DB", "ignition")
+
+global_retriever = None
 
 
+def build_db_uri() -> str:
+    return f"mysql+pymysql://{SQL_USER}:{SQL_PASSWORD}@{SQL_HOST}:{SQL_PORT}/{SQL_DB}"
+
+
+sql_db = SQLDatabase.from_uri(build_db_uri())
+
+
+# ----------------------------
+# [1] 도구 정의 (Tools)
+# ----------------------------
+# --- 1. OPC UA용 도구 ---
 @tool
 async def read_ignition_tag(tag_path: str):
     """
@@ -80,314 +86,310 @@ async def write_ignition_tag(tag_path: str, value: str):
 
 
 # 사용할 도구 목록
-tools = [read_ignition_tag, write_ignition_tag]
+chat_tools_list = [read_ignition_tag, write_ignition_tag]
 
 
-# --- [2. Lifespan & Setup] ---
-def langsmith_setup(project_name="Ignition-Agent-RAG"):
-    if os.environ.get("LANGCHAIN_API_KEY"):
-        os.environ["LANGCHAIN_TRACING_V2"] = "true"
-        os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
-        os.environ["LANGCHAIN_PROJECT"] = project_name
-        print(f"[System] LangSmith 추적 활성화: {project_name}")
+# --- 2. SQL용 (이력/DB) - 커스텀 도구 ---
+@tool
+def db_list_tables():
+    """DB의 모든 테이블 목록을 조회합니다."""
+    try:
+        return sql_db.get_table_names()
+    except Exception as e:
+        return f"Error: {e}"
 
 
-langsmith_setup()
+@tool
+def db_get_schema(table_names: str):
+    """특정 테이블의 스키마(컬럼 정보)를 조회합니다. (입력: 'table1, table2')"""
+    try:
+        if isinstance(table_names, list):
+            table_names = ", ".join(table_names)
+        return sql_db.get_table_info(table_names.split(","))
+    except Exception as e:
+        return f"Error: {e}"
 
 
+@tool
+def db_query(query: str):
+    """SQL SELECT 쿼리를 실행합니다. 반드시 LIMIT를 포함하세요."""
+    try:
+        if any(x in query.lower() for x in ["update", "delete", "drop", "insert"]):
+            return "Error: Read-only allowed."
+        return sql_db.run(query)
+    except Exception as e:
+        return f"SQL Error: {e}"
+
+
+sql_tools_list = [db_list_tables, db_get_schema, db_query]
+
+
+# ----------------------------
+# [2] Lifespan
+# ----------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global global_retriever
     print("\n[System] 서버 초기화 중...")
-
-    print(f"[System] 임베딩 모델 로드 중... (CUDA)")
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs={"device": "cuda"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-
-    if os.path.exists(DB_PATH):
-        print("[System] 벡터 DB 로딩 중...")
-        try:
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_NAME,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+        if os.path.exists(DB_PATH):
             vectorstore = FAISS.load_local(
                 DB_PATH, embeddings, allow_dangerous_deserialization=True
             )
             global_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-            print("[System] DB 로딩 완료.")
-        except Exception as e:
-            print(f"[Error] DB 로딩 실패: {e}")
-    else:
-        print("[System] ⚠️ 저장된 DB가 없습니다. (문서 검색 기능 비활성화)")
-
+            print("[System] 벡터 DB 로드 완료.")
+        else:
+            print("[System] DB 없음. RAG 제한됨.")
+    except Exception as e:
+        print(f"[Warning] 벡터 DB 실패: {e}")
     yield
     print("[System] 서버 종료")
 
 
-app = FastAPI(title="Ignition RAG Agent", lifespan=lifespan)
+app = FastAPI(title="Ignition Agent", lifespan=lifespan)
 
 
-# --- [3. LangGraph 로직] ---
+# ----------------------------
+# [3] Router (키워드 제거 -> LLM 판단)
+# ----------------------------
 
 
-class GradeDocuments(BaseModel):
-    binary_score: str = Field(description="'yes' or 'no'")
+# 라우팅 카테고리 정의
+class RouteResponse(BaseModel):
+    destination: Literal["sql_search", "rag_search", "chat"] = Field(
+        description="The target agent to route the user request to."
+    )
 
 
 class GraphState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
+    intent_category: str  # intent_category만 남김 (type/payload 등 복잡한거 제거)
+    payload: str
     documents: List[Document]
-    force_tool: bool
-    forced_tag_path: str
 
 
-# 1. 문서 검색
-def retrieve(state: GraphState):
-    print("\n[1] 문서 검색")
+# ----------------------------
+# [4] Node Functions
+# ----------------------------
+
+
+def intent_router(state: GraphState):
+    """
+    [핵심] LLM을 사용하여 사용자의 의도를 3가지 중 하나로 분류합니다.
+    - sql_search: DB, 역사, 통계, 로그
+    - rag_search: 매뉴얼, 지식, 정의, 방법
+    - chat: 실시간 값 조회, 제어, 일반 대화
+    """
+    print("🚦 [Router] 의도 분류 중...")
     question = state["messages"][-1].content
-    if global_retriever is None:
-        return {"documents": []}
 
-    docs = global_retriever.invoke(question)
-    print(f" -> {len(docs)}개 문서 검색됨")
-    return {"documents": docs}
+    llm = ChatOllama(model=LLM_MODEL_NAME, temperature=0, format="json")
 
-
-# 2. 문서 평가
-def grade_documents(state: GraphState):
-    print("\n[2] 문서 평가")
-    question = state["messages"][-1].content
-    documents = state["documents"]
-
-    llm = ChatOllama(model=LLM_MODEL_NAME, temperature=0, num_gpu=-1)
-    parser = JsonOutputParser(pydantic_object=GradeDocuments)
-
-    # 평가 프롬프트
+    # 분류 프롬프트
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "You are a grader. Return JSON {{'binary_score': 'yes'}} if the document is relevant to the question, otherwise {{'binary_score': 'no'}}.",
+                """You are a smart router. Classify the user question into one of three categories:
+        
+        1. 'sql_search': Questions about **historical data**, trends, logs, averages, past events, or database queries. (e.g., "What was the average RPM yesterday?", "Show error logs from last week")
+        2. 'rag_search': Questions asking for **definitions, manuals, troubleshooting guides, specifications**, or general knowledge. (e.g., "What is a Chiller?", "How to fix Error 505?", "Explain the pump structure")
+        3. 'chat': Requests for **real-time values**, **control commands**, greetings, or general chat. (e.g., "What is the current temperature?", "Turn on the motor", "Hi there")
+
+        Return ONLY a JSON object: {{"destination": "sql_search" | "rag_search" | "chat"}}
+        """,
             ),
-            ("human", "Doc: {document}\nQuestion: {question}"),
+            ("human", "{question}"),
         ]
     )
-    chain = prompt | llm | parser
 
-    filtered_docs = []
-    for doc in documents:
-        try:
-            score = chain.invoke({"question": question, "document": doc.page_content})
-            if score.get("binary_score") == "yes":
-                filtered_docs.append(doc)
-        except:
-            continue
+    chain = prompt | llm | JsonOutputParser()
 
-    print(f" -> {len(filtered_docs)}개 문서 유효함")
-    return {"documents": filtered_docs}
+    try:
+        result = chain.invoke({"question": question})
+        destination = result.get("destination", "chat")
+    except:
+        destination = "chat"  # 파싱 실패 시 기본값
 
+    print(f"🚦 [Router] Decision: {destination}")
 
-CMD_WORDS = ["켜", "꺼", "멈", "정지", "시작", "가동", "on", "off", "설정", "set"]
-DEVICE_HINT = re.compile(r"\bFAN\d+\b", re.IGNORECASE)  # FAN1, fan2 같은 패턴
-
-TAG_PATTERN = re.compile(r"(\[[^\]]+\][A-Za-z0-9_\-\/]+)")
+    return {
+        "intent_category": destination,
+        "payload": question,  # payload는 그대로 질문 내용
+    }
 
 
-# 도구 사용 강제 여부 판단
-def detect_realtime_intent(state: GraphState):
-    text = state["messages"][-1].content
-    lowered = text.lower()
-
-    # 1) 사용자가 태그를 직접 쓴 경우
-    m = TAG_PATTERN.search(text)
-    tag = m.group(1) if m else ""
-
-    # 2) 제어 명령인지 판단
-    is_cmd = any(w in lowered for w in CMD_WORDS)
-
-    # 3) 장비 힌트(예: FAN1)라도 있으면 제어로 취급
-    has_device = bool(DEVICE_HINT.search(text))
-
-    force = is_cmd and (bool(tag) or has_device)
-
-    return {"force_tool": force, "forced_tag_path": tag}
+def retrieve_rag(state: GraphState):
+    if not global_retriever:
+        return {"documents": []}
+    return {"documents": global_retriever.invoke(state["payload"])}
 
 
-# 도구 사용 강제 여부 판단
-def detect_realtime_intent(state: GraphState):
-    text = state["messages"][-1].content
-    has_tag = "[default]" in text
-
-    forced = ""
-    if has_tag:
-        m = re.search(r"(\[default\][\w\/\-]+)", text)
-        forced = m.group(1) if m else ""
-
-    return {"force_tool": has_tag, "forced_tag_path": forced}
-
-
-async def force_control(state: GraphState):
-    text = state["messages"][-1].content.lower()
-
-    # 태그가 있으면 그대로 쓰고
-    tag = state.get("forced_tag_path") or ""
-
-    # 없으면 “규칙 기반 매핑”으로 결정 (FAN1 → [default]FAN1/Status)
-    if not tag and DEVICE_HINT.search(state["messages"][-1].content):
-        dev = DEVICE_HINT.search(state["messages"][-1].content).group(0).upper()
-        tag = f"[default]{dev}/Status"
-
-    # 값 결정
-    value = "OFF" if ("멈" in text or "정지" in text or "off" in text) else "ON"
-
-    result = await opc_client.write_tag(tag, value)
-    return {"messages": [AIMessage(content=f"[제어 실행]\n{result}")]}
-
-
-# 3. RAG 답변 (문서 기반)
 def generate_rag(state: GraphState):
-    print("\n[3-A] RAG 답변 생성")
-    documents = state["documents"]
-    question = state["messages"][-1].content
-
-    llm = ChatOllama(model=LLM_MODEL_NAME, temperature=0, num_gpu=-1, num_ctx=4096)
-
-    system_prompt = (
-        "You are a Data Center Expert. "
-        "Answer the question strictly in **Korean**, based **only** on the provided [Context]. "
-        "Do not fabricate information."
-    )
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system_prompt),
-            ("human", "Context:\n{context}\n\nQuestion:\n{question}"),
-        ]
-    )
-    chain = prompt | llm | StrOutputParser()
-    response = chain.invoke({"context": documents, "question": question})
-    return {"messages": [AIMessage(content=response)]}
+    # 실제 구현 시에는 검색된 문서를 바탕으로 LLM 답변 생성 필요
+    context = "\n".join([d.page_content for d in state.get("documents", [])])
+    return {
+        "messages": [AIMessage(content=f"[RAG 결과]\n참고문서:\n{context[:200]}...")]
+    }
 
 
-# 4. 일반 대화 및 도구 사용 (문서 없음)
 def generate_chat(state: GraphState):
-    print("\n[3-B] 일반 대화/도구 모드")
-    messages = state["messages"]
-
-    # 도구 바인딩 (Bind Tools)
-    llm = ChatOllama(model=LLM_MODEL_NAME, temperature=0.1, num_gpu=-1)
-    llm_with_tools = llm.bind_tools(tools)
-
+    llm = ChatOllama(model=LLM_MODEL_NAME, temperature=0.1)
+    llm_with_tools = llm.bind_tools(chat_tools_list)
     system_msg = SystemMessage(
-        content=(
-            "You are an Ignition SCADA Operator. "
-            "NEVER answer tag current values from memory. "
-            "If the user asks for any current/now/real-time value or status, you MUST call read_ignition_tag again. "
-            "If the user wants to change values, use write_ignition_tag. "
-            "Answer naturally in Korean."
-        )
+        content="You are an Ignition SCADA Operator. Answer in Korean."
     )
-
-    # LLM 호출 (도구 호출 여부 결정 포함)
-    response = llm_with_tools.invoke([system_msg] + messages)
+    response = llm_with_tools.invoke([system_msg] + state["messages"])
     return {"messages": [response]}
 
 
-# 5. 라우팅 결정
-def route_after_detect(state: GraphState):
-    if state["documents"]:
-        return "generate_rag"
-    if state.get("force_tool"):
-        return "force_control"
-    return "generate_chat"
+def sql_generate(state: GraphState):
+    """
+    SQL 실행 및 결과 요약 에이전트
+    """
+    llm = ChatOllama(model=LLM_MODEL_NAME, temperature=0)
+    llm_with_tools = llm.bind_tools(sql_tools_list)
+
+    # [핵심 수정] Ignition DB 구조를 '강제로' 주입하는 프롬프트
+    system_msg = SystemMessage(
+        content=(
+            "You are an expert on **Ignition Historian Databases (MariaDB)**.\n"
+            "This database uses a specific schema where Tag Names and Data are separated.\n"
+            "You must follow the **Strict Execution Path** below. Do NOT guess table names.\n\n"
+            "### 🗺️ Database Structure Map (READ CAREFULLY)\n"
+            "1. **`sqlth_te` Table**: Contains Tag Definitions.\n"
+            "   - Columns: `id` (Tag ID), `tagpath` (Tag Name)\n"
+            "   - Usage: Query this table FIRST to convert a Tag Name (e.g., 'FAN1') into an `id`.\n"
+            "2. **`sqlt_data_X_YYYY_MM` Tables**: Contains History Data (Partitioned by Month).\n"
+            "   - Example: `sqlt_data_1_2026_01` (Data for Jan 2026)\n"
+            "   - Columns: `tagid` (Foreign Key), `intvalue`, `floatvalue`, `t_stamp` (Unix Timestamp)\n"
+            "   - Usage: Query this table SECOND using the `tagid` found in step 1.\n\n"
+            "### 🛣️ Strict Execution Path\n"
+            "When the user asks: 'Get average RPM of FAN1 on 2026-01-18':\n"
+            "1. **Call `db_list_tables()`**: Find the partition table that matches the target date (look for `_2026_01`).\n"
+            "2. **Call `db_query()` on `sqlth_te`**: Find the ID for the tag.\n"
+            "   - Query: `SELECT id, tagpath FROM sqlth_te WHERE tagpath LIKE '%FAN1%'`\n"
+            "3. **Call `db_query()` on partition table**: Use the `id` from Step 2 to get data.\n"
+            "   - Query: `SELECT AVG(floatvalue) FROM sqlt_data_1_2026_01 WHERE tagid = [FOUND_ID] AND t_stamp BETWEEN ...`\n"
+            "4. **Final Answer**: Summarize in Korean.\n\n"
+            "**🚫 PROHIBITED ACTIONS:**\n"
+            "- NEVER try `SELECT ... FROM FAN1`. 'FAN1' is a value in `tagpath`, NOT a table name.\n"
+            "- NEVER skip `db_list_tables()`. You don't know which partition index (1, 5, etc.) exists for the date.\n"
+        )
+    )
+
+    # 메시지 히스토리 포함
+    messages = [system_msg] + state["messages"]
+
+    response = llm_with_tools.invoke(messages)
+    return {"messages": [response]}
 
 
-# --- [4. 그래프 구축] ---#
+async def exec_tag_read(state: GraphState):
+    # Chat에서 Tool을 호출하면 이쪽으로 올 수도 있고, Chat Loop 내에서 처리될 수도 있음.
+    # 여기서는 Chat Loop 사용하므로 이 노드는 사실상 안 쓰이거나 간단한 로그용
+    pass
+
+
+async def exec_tag_set(state: GraphState):
+    pass
+
+
+# ----------------------------
+# [5] Graph Build
+# ----------------------------
+
+
+def route_decision(state: GraphState):
+    return state["intent_category"]
+
+
 def build_graph():
     memory = MemorySaver()
-    workflow = StateGraph(GraphState)
+    wf = StateGraph(GraphState)
 
-    # 노드 추가
-    workflow.add_node("retrieve", retrieve)
-    workflow.add_node("grade_documents", grade_documents)
-    workflow.add_node("generate_rag", generate_rag)
-    workflow.add_node("generate_chat", generate_chat)
-    workflow.add_node("detect_realtime_intent", detect_realtime_intent)
-    workflow.add_node("force_control", force_control)
-    workflow.add_node("tools", ToolNode(tools))
+    # 노드 등록
+    wf.add_node("intent_router", intent_router)  # [변경] ingest_intent 대신 Router 사용
 
-    # 엣지 연결
-    workflow.add_edge(START, "retrieve")
-    workflow.add_edge("retrieve", "grade_documents")
-    workflow.add_edge("grade_documents", "detect_realtime_intent")
+    wf.add_node("retrieve_rag", retrieve_rag)
+    wf.add_node("generate_rag", generate_rag)
 
-    # detect 결과 라우팅
-    workflow.add_conditional_edges(
-        "detect_realtime_intent",
-        route_after_detect,
+    wf.add_node("generate_chat", generate_chat)
+    wf.add_node("sql_generate", sql_generate)
+
+    wf.add_node("chat_tools_node", ToolNode(chat_tools_list))
+    wf.add_node("sql_tools_node", ToolNode(sql_tools_list))
+
+    # 시작 -> 라우터
+    wf.add_edge(START, "intent_router")
+
+    # 라우터 -> 분기
+    wf.add_conditional_edges(
+        "intent_router",
+        route_decision,
         {
-            "generate_rag": "generate_rag",
-            "generate_chat": "generate_chat",
-            "force_control": "force_control",
+            "sql_search": "sql_generate",
+            "rag_search": "retrieve_rag",
+            "chat": "generate_chat",
         },
     )
 
-    # force_control는 종료
-    workflow.add_edge("force_control", END)
+    # RAG 경로
+    wf.add_edge("retrieve_rag", "generate_rag")
+    wf.add_edge("generate_rag", END)
 
-    # generate_chat에서 tool_call이 있으면 tools로
-    workflow.add_conditional_edges(
-        "generate_chat",
-        tools_condition,
-        {"tools": "tools", END: END},
+    # Chat 경로 (Loop)
+    wf.add_conditional_edges(
+        "generate_chat", tools_condition, {"tools": "chat_tools_node", END: END}
     )
+    wf.add_edge("chat_tools_node", "generate_chat")
 
-    # tools 실행 결과를 다시 generate_chat로 보내 최종 문장 생성
-    workflow.add_edge("tools", "generate_chat")
+    # SQL 경로 (Loop)
+    wf.add_conditional_edges(
+        "sql_generate", tools_condition, {"tools": "sql_tools_node", END: END}
+    )
+    wf.add_edge("sql_tools_node", "sql_generate")
 
-    # RAG는 종료
-    workflow.add_edge("generate_rag", END)
-
-    return workflow.compile(checkpointer=memory)
+    return wf.compile(checkpointer=memory)
 
 
 app_graph = build_graph()
 
 
-# --- [5. API Endpoint] ---
+# ----------------------------
+# [6] API Endpoint
+# ----------------------------
 class QueryRequest(BaseModel):
     question: str
     thread_id: str = "default_user"
 
 
 @app.post("/ask")
-async def ask_rag(request: QueryRequest):
-    print(f"\n[Request] Thread: {request.thread_id} | Q: {request.question}")
+async def ask(request: QueryRequest):
+    print(f"\nQ : {request.question}")
 
-    # Memory 설정을 위한 config
-    config = RunnableConfig(configurable={"thread_id": request.thread_id})
-
-    # 초기 입력 메시지
     inputs = {"messages": [HumanMessage(content=request.question)]}
+    config = RunnableConfig(
+        configurable={"thread_id": request.thread_id}, recursion_limit=30
+    )
 
-    # [수정됨] 비동기 도구(OPC UA)를 사용하므로 await ainvoke()를 써야 합니다.
     result = await app_graph.ainvoke(inputs, config=config)
 
-    # 최종 답변 추출 (마지막 메시지)
-    final_answer = result["messages"][-1].content
-
-    # 소스 정리 (RAG 모드일 때만 존재)
-    sources = []
-    if "documents" in result and result["documents"]:
-        sources = list(
-            set([doc.metadata.get("source", "Unknown") for doc in result["documents"]])
-        )
-
-    print(f"[Response] 완료 (Sources: {len(sources)})")
+    last_message = result["messages"][-1]
+    final_answer = (
+        last_message.content
+        if isinstance(last_message, AIMessage)
+        else "답변을 생성하지 못했습니다."
+    )
 
     return {
-        "question": request.question,
+        "intent": result.get("intent_category"),
         "answer": final_answer,
-        "sources": sources,
     }
 
 
